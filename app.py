@@ -1,5 +1,5 @@
 """
-app.py - Feni Model High School OMR Grader (Streamlit Web App)
+app.py - Feni Model High School OMR Grader (Batch Update)
 """
 
 import cv2
@@ -30,7 +30,6 @@ COLUMN_ROIS = [
     (660, 580, 160, 480)
 ]
 
-
 def order_points(pts):
     rect = np.zeros((4, 2), dtype="float32")
     s = pts.sum(axis=1)
@@ -41,14 +40,12 @@ def order_points(pts):
     rect[3] = pts[np.argmax(diff)]
     return rect
 
-
 def four_point_transform(image, pts, out_size):
     rect = order_points(pts)
     w, h = out_size
     dst = np.array([[0, 0], [w - 1, 0], [w - 1, h - 1], [0, h - 1]], dtype="float32")
     matrix = cv2.getPerspectiveTransform(rect, dst)
     return cv2.warpPerspective(image, matrix, (w, h))
-
 
 def find_sheet_contour(image):
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
@@ -67,7 +64,6 @@ def find_sheet_contour(image):
             return approx.reshape(4, 2).astype("float32")
     return None
 
-
 def sort_contours_spatial(cnts):
     boxes = [cv2.boundingRect(c) for c in cnts]
     sorted_pairs = sorted(zip(cnts, boxes), key=lambda b: b[1][1])
@@ -77,7 +73,6 @@ def sort_contours_spatial(cnts):
         group = sorted(group, key=lambda b: b[1][0])
         rows.append([c for c, box in group])
     return rows
-
 
 def process_column(roi_thresh, roi_color, start_q_num, answer_key, options):
     cnts, _ = cv2.findContours(roi_thresh, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
@@ -148,7 +143,7 @@ def process_column(roi_thresh, roi_color, start_q_num, answer_key, options):
 # --- Streamlit UI ---
 st.title("🏫 Feni Model High School")
 st.subheader("Automated OMR Answer Sheet Grader")
-st.write("Take a photo with your phone camera or upload an image to grade automatically.")
+st.write("Grade a single sheet or upload a whole class batch at once!")
 
 st.sidebar.header("⚙️ Answer Key Options")
 st.sidebar.info("Option Key:\n**A = ক | B = খ | C = গ | D = ঘ**")
@@ -162,62 +157,61 @@ user_key = st.sidebar.text_area(
 
 answer_list = [a.strip().upper() for a in user_key.split(",") if a.strip()]
 
-input_mode = st.radio("Choose Input Method:", ["📸 Take Photo with Camera", "📁 Upload Image from Phone/PC"], horizontal=True)
+input_mode = st.radio("Choose Input Method:", ["📸 Camera (One by One)", "📁 Bulk Upload (Whole Class)"], horizontal=True)
 
-uploaded_file = None
-if input_mode == "📸 Take Photo with Camera":
-    uploaded_file = st.camera_input("Point camera directly at the sheet")
+uploaded_files = []
+if input_mode == "📸 Camera (One by One)":
+    cam_photo = st.camera_input("Point camera directly at the sheet")
+    if cam_photo:
+        uploaded_files.append(cam_photo)
 else:
-    uploaded_file = st.file_uploader("Upload OMR Photo", type=["jpg", "jpeg", "png"])
+    # This single line change allows selecting 120 photos at once!
+    uploaded_files = st.file_uploader("Select multiple OMR Photos from your gallery", type=["jpg", "jpeg", "png"], accept_multiple_files=True)
 
-if uploaded_file is not None:
+if uploaded_files:
     if len(answer_list) != NUM_QUESTIONS:
         st.error(f"⚠️ Answer key must contain exactly 30 answers. Currently provided: {len(answer_list)}")
     else:
-        bytes_data = uploaded_file.getvalue()
-        file_bytes = np.frombuffer(bytes_data, np.uint8)
-        image = cv2.imdecode(file_bytes, cv2.IMREAD_COLOR)
+        st.success(f"Processing {len(uploaded_files)} paper(s)...")
+        
+        class_results = []
 
-        corners = find_sheet_contour(image)
+        for file in uploaded_files:
+            bytes_data = file.getvalue()
+            file_bytes = np.frombuffer(bytes_data, np.uint8)
+            image = cv2.imdecode(file_bytes, cv2.IMREAD_COLOR)
 
-        if corners is None:
-            st.error("❌ Could not detect sheet boundaries. Ensure the full paper is visible, flat, and well-lit.")
-        else:
-            warped = four_point_transform(image, corners, WARPED_SIZE)
-            gray = cv2.cvtColor(warped, cv2.COLOR_BGR2GRAY)
-            gray = cv2.GaussianBlur(gray, (3, 3), 0)
-            thresh = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV | cv2.THRESH_OTSU)[1]
+            corners = find_sheet_contour(image)
 
-            total_correct = 0
-            all_results = []
+            if corners is None:
+                st.error(f"❌ Could not detect sheet boundaries in **{file.name}**.")
+                class_results.append({"Filename": file.name, "Score": "Error", "Percentage": "Error"})
+            else:
+                warped = four_point_transform(image, corners, WARPED_SIZE)
+                gray = cv2.cvtColor(warped, cv2.COLOR_BGR2GRAY)
+                gray = cv2.GaussianBlur(gray, (3, 3), 0)
+                thresh = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV | cv2.THRESH_OTSU)[1]
 
-            for col_idx, (x, y, w, h) in enumerate(COLUMN_ROIS):
-                roi_thresh = thresh[y:y+h, x:x+w]
-                roi_color = warped[y:y+h, x:x+w]
-                start_q = col_idx * 10 + 1
-                col_res, col_score = process_column(roi_thresh, roi_color, start_q, answer_list, OPTIONS)
-                all_results.extend(col_res)
-                total_correct += col_score
+                total_correct = 0
+                for col_idx, (x, y, w, h) in enumerate(COLUMN_ROIS):
+                    roi_thresh = thresh[y:y+h, x:x+w]
+                    roi_color = warped[y:y+h, x:x+w]
+                    start_q = col_idx * 10 + 1
+                    _, col_score = process_column(roi_thresh, roi_color, start_q, answer_list, OPTIONS)
+                    total_correct += col_score
 
-            score_pct = (total_correct / NUM_QUESTIONS) * 100
-            
-            st.success(f"### 🎉 Final Score: **{total_correct} / {NUM_QUESTIONS}** ({score_pct:.1f}%)")
+                score_pct = (total_correct / NUM_QUESTIONS) * 100
+                class_results.append({"Filename": file.name, "Score": total_correct, "Percentage": f"{score_pct:.1f}%"})
 
-            cv2.putText(warped, f"Score: {total_correct}/{NUM_QUESTIONS} ({score_pct:.1f}%)",
-                        (30, 50), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 0, 255), 2)
+                cv2.putText(warped, f"Score: {total_correct}/{NUM_QUESTIONS} ({score_pct:.1f}%)",
+                            (30, 50), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 0, 255), 2)
+                warped_rgb = cv2.cvtColor(warped, cv2.COLOR_BGR2RGB)
 
-            warped_rgb = cv2.cvtColor(warped, cv2.COLOR_BGR2RGB)
-            st.image(warped_rgb, caption="Graded Result (Green = Correct, Red = Wrong)", use_column_width=True)
+                # Puts each image into a drop-down menu so 120 images don't flood the screen
+                with st.expander(f"📄 Result for {file.name} - Score: {total_correct}/30"):
+                    st.image(warped_rgb, use_column_width=True)
 
-            with st.expander("📋 View Question-by-Question Breakdown"):
-                table_data = []
-                for r in sorted(all_results, key=lambda x: x["question"]):
-                    status = "✅ Correct" if r["is_correct"] else "❌ Wrong"
-                    marked_val = r["marked"] if r["marked"] else "BLANK"
-                    table_data.append({
-                        "Question": f"Q{r['question']}",
-                        "Student Choice": marked_val,
-                        "Correct Answer": r["correct"],
-                        "Result": status
-                    })
-                st.table(table_data)
+        # Show Class Summary Table at the bottom if doing multiple sheets
+        if len(class_results) > 1:
+            st.subheader("📊 Class Summary Table")
+            st.table(class_results)
