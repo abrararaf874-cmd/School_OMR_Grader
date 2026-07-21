@@ -1,5 +1,5 @@
 """
-app.py - Feni Model High School OMR Grader (Batch Update)
+app.py - Feni Model High School OMR Grader (Dynamic Question Count)
 """
 
 import cv2
@@ -15,7 +15,6 @@ st.set_page_config(
 )
 
 # --- OMR Configuration ---
-NUM_QUESTIONS = 30
 OPTIONS = ["A", "B", "C", "D"]
 WARPED_SIZE = (850, 1100)
 
@@ -86,13 +85,19 @@ def process_column(roi_thresh, roi_color, start_q_num, answer_key, options):
     col_results = []
     correct_count = 0
 
-    if len(bubbles) != 40:
+    # Ensure bubbles are found and are in multiples of 4 (A, B, C, D)
+    if len(bubbles) == 0 or len(bubbles) % 4 != 0:
         return col_results, 0
 
     rows = sort_contours_spatial(bubbles)
 
     for r_idx, row in enumerate(rows):
         q_num = start_q_num + r_idx
+        
+        # STOP processing if we have reached the end of the teacher's answer key
+        if q_num > len(answer_key):
+            break
+            
         fills = []
 
         for c in row:
@@ -148,9 +153,10 @@ st.write("Grade a single sheet or upload a whole class batch at once!")
 st.sidebar.header("⚙️ Answer Key Options")
 st.sidebar.info("Option Key:\n**A = ক | B = খ | C = গ | D = ঘ**")
 
-default_key_str = "B," + ",".join(["A"] * 29)
+# Defaulting to 25 answers to show it's dynamic
+default_key_str = "B," + ",".join(["A"] * 24) 
 user_key = st.sidebar.text_area(
-    "Enter 30 Answers (Comma-separated):",
+    "Enter Answers (Comma-separated, up to 30):",
     value=default_key_str,
     height=120
 )
@@ -165,14 +171,17 @@ if input_mode == "📸 Camera (One by One)":
     if cam_photo:
         uploaded_files.append(cam_photo)
 else:
-    # This single line change allows selecting 120 photos at once!
     uploaded_files = st.file_uploader("Select multiple OMR Photos from your gallery", type=["jpg", "jpeg", "png"], accept_multiple_files=True)
 
 if uploaded_files:
-    if len(answer_list) != NUM_QUESTIONS:
-        st.error(f"⚠️ Answer key must contain exactly 30 answers. Currently provided: {len(answer_list)}")
+    num_questions = len(answer_list)
+    
+    if num_questions == 0:
+        st.error("⚠️ Please enter an answer key in the sidebar.")
+    elif num_questions > 30:
+        st.error(f"⚠️ Maximum 30 questions supported. You entered {num_questions}.")
     else:
-        st.success(f"Processing {len(uploaded_files)} paper(s)...")
+        st.success(f"Grading out of **{num_questions} questions**. Processing {len(uploaded_files)} paper(s)...")
         
         class_results = []
 
@@ -197,21 +206,22 @@ if uploaded_files:
                     roi_thresh = thresh[y:y+h, x:x+w]
                     roi_color = warped[y:y+h, x:x+w]
                     start_q = col_idx * 10 + 1
-                    _, col_score = process_column(roi_thresh, roi_color, start_q, answer_list, OPTIONS)
-                    total_correct += col_score
+                    
+                    # Only process the column if we haven't exceeded the total questions
+                    if start_q <= num_questions:
+                        _, col_score = process_column(roi_thresh, roi_color, start_q, answer_list, OPTIONS)
+                        total_correct += col_score
 
-                score_pct = (total_correct / NUM_QUESTIONS) * 100
+                score_pct = (total_correct / num_questions) * 100
                 class_results.append({"Filename": file.name, "Score": total_correct, "Percentage": f"{score_pct:.1f}%"})
 
-                cv2.putText(warped, f"Score: {total_correct}/{NUM_QUESTIONS} ({score_pct:.1f}%)",
+                cv2.putText(warped, f"Score: {total_correct}/{num_questions} ({score_pct:.1f}%)",
                             (30, 50), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 0, 255), 2)
                 warped_rgb = cv2.cvtColor(warped, cv2.COLOR_BGR2RGB)
 
-                # Puts each image into a drop-down menu so 120 images don't flood the screen
-                with st.expander(f"📄 Result for {file.name} - Score: {total_correct}/30"):
+                with st.expander(f"📄 Result for {file.name} - Score: {total_correct}/{num_questions}"):
                     st.image(warped_rgb, use_column_width=True)
 
-        # Show Class Summary Table at the bottom if doing multiple sheets
         if len(class_results) > 1:
             st.subheader("📊 Class Summary Table")
             st.table(class_results)
