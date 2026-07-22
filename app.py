@@ -225,3 +225,48 @@ if uploaded_files:
         if len(class_results) > 1:
             st.subheader("📊 Class Summary Table")
             st.table(class_results)
+
+# --- Language Selector & App Description ---
+st.sidebar.markdown("---")
+language = st.sidebar.radio("🌐 Language / ভাষা", ["English", "বাংলা"])
+
+if language == "English":
+    with st.expander("📖 About & How to Use This App", expanded=False):
+        st.markdown("""
+        ### 🏫 About the App
+        This app is designed for **Feni Model High School** teachers to quickly and accurately grade multiple-choice (MCQ) answer sheets using a mobile camera or uploaded files.
+
+        ---
+
+        ### 📱 Step-by-Step Instructions:
+        1. **Set the Answer Key (Sidebar):** Type your correct answers separated by commas (e.g., `A, B, C, D...`). 
+           * *Key Reference: A = ক | B = খ | C = গ | D = ঘ*
+        2. **Choose Input Mode:**
+           * 📸 **Camera:** Grade sheets live one-by-one.
+           * 📁 **Bulk Upload:** Upload up to 120+ student photos from your gallery at once!
+        3. **Important Scanning Tips:**
+           * Place paper flat on a dark surface (like a desk).
+           * Ensure **all 4 corners** of the sheet are visible in the photo.
+           * Make sure the room is well-lit without heavy shadows.
+        4. **View Results:** See instant total scores, annotated green/red marked sheets, and a complete class summary table!
+        """)
+else:
+    with st.expander("📖 অ্যাপ পরিচিতি ও ব্যবহারের নিয়ম", expanded=False):
+        st.markdown("""
+        ### 🏫 ওএমআর গ্রেডার পরিচিতি
+        এই ওয়েব অ্যাপটি **ফেনী মডেল হাই স্কুল**-এর শিক্ষকদের জন্য তৈরি করা হয়েছে। এর মাধ্যমে যেকোনো স্মার্টফোন ক্যামেরা বা কম্পিউটারের সাহায্যে খুব সহজেই এবং দ্রুত বহুনির্বাচনী (MCQ) উত্তরপত্র মূল্যায়ন করা যাবে।
+
+        ---
+
+        ### 📱 ব্যবহারের নিয়মাবলি:
+        ১. **উত্তরমালা সেটিং (সাইডবার):** সাইডবারে কমা দিয়ে সঠিক উত্তরগুলো লিখুন (যেমন: `A, B, C, D...`)। 
+           * *সংকেত: A = ক | B = খ | C = গ | D = ঘ*
+        ২. **মোড নির্বাচন করুন:**
+           * 📸 **ক্যামেরা:** একে একে প্রতিটি উত্তরপত্রের ছবি তুলে চেক করুন।
+           * 📁 **বাল্ক আপলোড:** একসাথে পুরো ক্লাসের (১২০+ টি) ছবি গ্যালারি থেকে সিলেক্ট করে আপলোড করুন!
+        ৩. **ছবি তোলার জরুরি টিপস:**
+           * কাগজটি একটি অন্ধকার বা গাঢ় টেবিলের ওপর সোজা করে রাখুন।
+           * ছবির ভেতরে যেন উত্তরপত্রের **৪টি কোণই** পরিষ্কার দেখা যায়।
+           * পর্যাপ্ত আলো বজায় রাখুন যেন কোনো ছায়া না পড়ে।
+        ৪. **ফলাফল দেখুন:** অ্যাপটি সাথে সাথে মোট নম্বর হিসাব করবে, ছবিতে সঠিক (সবুজ) ও ভুল (লাল) চিহ্নিত করবে এবং পুরো ক্লাসের ফলাফল তালিকা দেখাবে!
+        """)
