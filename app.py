@@ -1,10 +1,11 @@
 """
-app.py - Feni Model High School OMR Grader (Dynamic Question Count)
+app.py - Feni Model High School OMR Grader (Robust Mobile Version)
 """
 import cv2
 import numpy as np
 import streamlit as st
-from PIL import Image
+from PIL import Image, ImageOps
+import io
 
 # --- Page Configuration ---
 st.set_page_config(
@@ -16,15 +17,28 @@ st.set_page_config(
 # --- OMR Configuration ---
 OPTIONS = ["A", "B", "C", "D"]
 WARPED_SIZE = (850, 1100)
-MIN_BUBBLE_DIM = 12
-MAX_BUBBLE_DIM = 40
-FILL_RATIO_THRESHOLD = 0.40
-MULTI_MARK_MARGIN = 0.12
-COLUMN_ROIS = [
-    (340, 580, 160, 480),
-    (500, 580, 160, 480),
-    (660, 580, 160, 480)
+
+# FIX: Relative ROIs so they scale with WARPED_SIZE
+COLUMN_ROIS_REL = [
+    (0.40, 0.52, 0.19, 0.44),
+    (0.59, 0.52, 0.19, 0.44),
+    (0.78, 0.52, 0.19, 0.44),
 ]
+
+MIN_BUBBLE_DIM = 10
+MAX_BUBBLE_DIM = 45
+FILL_RATIO_THRESHOLD = 0.35
+MULTI_MARK_RELATIVE_MARGIN = 0.28  # FIX: Relative instead of absolute
+Y_CLUSTER_TOLERANCE = 18
+MIN_CIRCULARITY = 0.65
+
+
+def get_absolute_rois(width, height):
+    """Convert relative ROIs to absolute pixel coordinates."""
+    return [
+        (int(x * width), int(y * height), int(w * width), int(h * height))
+        for x, y, w, h in COLUMN_ROIS_REL
+    ]
 
 
 def order_points(pts):
@@ -48,89 +62,152 @@ def four_point_transform(image, pts, out_size):
 
 def find_sheet_contour(image):
     """
-    FIXED: the old version traced Canny edges and required them to form
-    one continuous closed loop. On a real phone photo, shadows, uneven
-    lighting, or a slightly curled page break that loop into pieces, so
-    it never simplified to a clean 4-point shape (this is exactly what
-    was happening on your test photo -- the biggest edge-loop found was
-    roughly 6-8x smaller than the whole page).
-
-    This version instead segments by brightness: the paper is much
-    brighter than the desk behind it, so Otsu thresholding isolates its
-    silhouette directly, which survives small shadows/gaps much better
-    than continuous edge-tracing does. A morphological close/open cleans
-    up small holes and specks, and if the paper's outline still doesn't
-    simplify to a clean quadrilateral, it falls back to the rotated
-    bounding box of the largest bright region (always 4 points, and
-    correctly handles a tilted photo).
+    FIX: Added Canny fallback and lowered area threshold for mobile photos.
     """
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
     blurred = cv2.GaussianBlur(gray, (5, 5), 0)
 
+    # Method 1: Otsu thresholding
     _, mask = cv2.threshold(blurred, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
     mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((15, 15), np.uint8))
     mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, np.ones((5, 5), np.uint8))
 
     cnts, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+    # FIX: Fallback to Canny if Otsu finds nothing useful
+    if not cnts:
+        edges = cv2.Canny(blurred, 50, 150)
+        edges = cv2.dilate(edges, np.ones((5, 5), np.uint8), iterations=2)
+        cnts, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
     if not cnts:
         return None
 
     largest = max(cnts, key=cv2.contourArea)
     img_area = image.shape[0] * image.shape[1]
-    if cv2.contourArea(largest) < 0.15 * img_area:
+
+    # FIX: Lowered from 0.15 to 0.08 for mobile photos
+    if cv2.contourArea(largest) < 0.08 * img_area:
         return None
 
     peri = cv2.arcLength(largest, True)
     approx = cv2.approxPolyDP(largest, 0.02 * peri, True)
+
     if len(approx) == 4:
         return approx.reshape(4, 2).astype("float32")
 
-    # Fallback: rotated bounding box of the paper's silhouette
+    # Fallback: rotated bounding box
     rect = cv2.minAreaRect(largest)
     return cv2.boxPoints(rect).astype("float32")
 
 
-def sort_contours_spatial(cnts):
-    boxes = [cv2.boundingRect(c) for c in cnts]
-    sorted_pairs = sorted(zip(cnts, boxes), key=lambda b: b[1][1])
+def is_valid_bubble(c):
+    """
+    FIX: Added circularity check to reject text fragments and noise.
+    """
+    x, y, w, h = cv2.boundingRect(c)
+    if not (MIN_BUBBLE_DIM <= w <= MAX_BUBBLE_DIM and MIN_BUBBLE_DIM <= h <= MAX_BUBBLE_DIM):
+        return False
+    if not (0.7 <= w / float(h) <= 1.3):
+        return False
+
+    area = cv2.contourArea(c)
+    perimeter = cv2.arcLength(c, True)
+    if perimeter == 0:
+        return False
+
+    circularity = 4 * np.pi * area / (perimeter ** 2)
+    return circularity >= MIN_CIRCULARITY
+
+
+def cluster_bubbles_into_rows(bubbles, y_tolerance=Y_CLUSTER_TOLERANCE):
+    """
+    FIX: Replaced fragile 'slice every 4' with proper y-coordinate clustering.
+    Handles missing bubbles and noise gracefully.
+    """
+    if not bubbles:
+        return []
+
+    bubbles = sorted(bubbles, key=lambda b: b[1][1])  # Sort by y
     rows = []
-    for i in range(0, len(sorted_pairs), 4):
-        group = sorted_pairs[i:i + 4]
-        group = sorted(group, key=lambda b: b[1][0])
-        rows.append([c for c, box in group])
+    current_row = [bubbles[0]]
+
+    for bubble in bubbles[1:]:
+        _, (_, y, _, _) = bubble
+        row_y_mean = np.mean([b[1][1] for b in current_row])
+
+        if abs(y - row_y_mean) <= y_tolerance:
+            current_row.append(bubble)
+        else:
+            current_row = sorted(current_row, key=lambda b: b[1][0])
+            if len(current_row) >= 3:  # At least 3 of 4 options
+                rows.append(current_row)
+            current_row = [bubble]
+
+    current_row = sorted(current_row, key=lambda b: b[1][0])
+    if len(current_row) >= 3:
+        rows.append(current_row)
+
     return rows
 
 
-def process_column(roi_thresh, roi_color, start_q_num, answer_key, options):
+def process_column(roi_thresh, roi_color, start_q_num, answer_key, options, debug=False):
     cnts, _ = cv2.findContours(roi_thresh, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
+
     bubbles = []
     for c in cnts:
-        x, y, w, h = cv2.boundingRect(c)
-        if MIN_BUBBLE_DIM <= w <= MAX_BUBBLE_DIM and MIN_BUBBLE_DIM <= h <= MAX_BUBBLE_DIM:
-            if 0.75 <= w / float(h) <= 1.25:
-                bubbles.append(c)
+        if is_valid_bubble(c):
+            bubbles.append((c, cv2.boundingRect(c)))
 
     col_results = []
     correct_count = 0
 
-    # Ensure bubbles are found and are in multiples of 4 (A, B, C, D)
-    if len(bubbles) == 0 or len(bubbles) % 4 != 0:
+    # FIX: Graceful minimum instead of strict modulo check
+    if len(bubbles) < 12:
+        if debug:
+            st.warning(f"Col starting Q{start_q_num}: Only {len(bubbles)} bubbles found.")
         return col_results, 0
 
-    rows = sort_contours_spatial(bubbles)
+    rows = cluster_bubbles_into_rows(bubbles)
+
+    if len(rows) < 3:
+        if debug:
+            st.warning(f"Col starting Q{start_q_num}: Only {len(rows)} rows clustered.")
+        return col_results, 0
 
     for r_idx, row in enumerate(rows):
         q_num = start_q_num + r_idx
         if q_num > len(answer_key):
             break
 
+        if len(row) < 3:
+            continue
+
+        row = sorted(row, key=lambda b: b[1][0])
+
+        # FIX: If noise gives >4 bubbles, keep the 4 largest (most likely real bubbles)
+        if len(row) > 4:
+            row = sorted(row, key=lambda b: -cv2.contourArea(b[0]))[:4]
+            row = sorted(row, key=lambda b: b[1][0])
+
         fills = []
-        for c in row:
+        for c, (x, y, w, h) in row[:4]:
             mask = np.zeros(roi_thresh.shape, dtype="uint8")
             cv2.drawContours(mask, [c], -1, 255, -1)
+
+            # FIX: Erode mask slightly to ignore border pixels
+            mask = cv2.erode(mask, np.ones((2, 2), np.uint8), iterations=1)
+
             bubble_area = cv2.countNonZero(mask)
+            if bubble_area == 0:
+                fills.append(0.0)
+                continue
+
             filled = cv2.countNonZero(cv2.bitwise_and(roi_thresh, roi_thresh, mask=mask))
-            fills.append(filled / float(bubble_area) if bubble_area else 0.0)
+            fills.append(filled / float(bubble_area))
+
+        while len(fills) < 4:
+            fills.append(0.0)
 
         best_idx = int(np.argmax(fills))
         best_val = fills[best_idx]
@@ -138,7 +215,8 @@ def process_column(roi_thresh, roi_color, start_q_num, answer_key, options):
 
         if best_val < FILL_RATIO_THRESHOLD:
             marked = None
-        elif (best_val - runner_up) < MULTI_MARK_MARGIN:
+        # FIX: Relative margin for multi-mark detection
+        elif runner_up > 0 and ((best_val - runner_up) / best_val) < MULTI_MARK_RELATIVE_MARGIN:
             marked = "MULTI"
         else:
             marked = options[best_idx]
@@ -151,20 +229,20 @@ def process_column(roi_thresh, roi_color, start_q_num, answer_key, options):
             "question": q_num,
             "marked": marked,
             "correct": correct_letter,
-            "is_correct": is_correct
+            "is_correct": is_correct,
         })
 
-        for j, c in enumerate(row):
-            x, y, w, h = cv2.boundingRect(c)
+        for j, (c, (x, y, w, h)) in enumerate(row[:4]):
             center = (x + w // 2, y + h // 2)
             radius = max(w, h) // 2 + 1
             letter = options[j]
+
             if letter == marked and is_correct:
-                cv2.circle(roi_color, center, radius, (0, 200, 0), 2)
+                cv2.circle(roi_color, center, radius, (0, 255, 0), 3)
             elif letter == marked and not is_correct:
-                cv2.circle(roi_color, center, radius, (0, 0, 255), 2)
+                cv2.circle(roi_color, center, radius, (0, 0, 255), 3)
             if letter == correct_letter and not is_correct:
-                cv2.circle(roi_color, center, radius, (0, 200, 0), 1)
+                cv2.circle(roi_color, center, radius, (0, 255, 0), 1)
 
     return col_results, correct_count
 
@@ -172,7 +250,6 @@ def process_column(roi_thresh, roi_color, start_q_num, answer_key, options):
 # --- Streamlit UI ---
 st.title("🏫 Feni Model High School")
 st.subheader("Automated OMR Answer Sheet Grader")
-st.write("Grade a single sheet or upload a whole class batch at once!")
 
 st.sidebar.header("⚙️ Answer Key Options")
 st.sidebar.info("Option Key:\n**A = ক | B = খ | C = গ | D = ঘ**")
@@ -185,7 +262,13 @@ user_key = st.sidebar.text_area(
 )
 answer_list = [a.strip().upper() for a in user_key.split(",") if a.strip()]
 
-input_mode = st.radio("Choose Input Method:", ["📸 Camera (One by One)", "📁 Bulk Upload (Whole Class)"], horizontal=True)
+debug_mode = st.sidebar.checkbox("🔍 Debug Mode", value=False)
+
+input_mode = st.radio(
+    "Choose Input Method:",
+    ["📸 Camera (One by One)", "📁 Bulk Upload (Whole Class)"],
+    horizontal=True
+)
 
 uploaded_files = []
 if input_mode == "📸 Camera (One by One)":
@@ -193,7 +276,11 @@ if input_mode == "📸 Camera (One by One)":
     if cam_photo:
         uploaded_files.append(cam_photo)
 else:
-    uploaded_files = st.file_uploader("Select multiple OMR Photos from your gallery", type=["jpg", "jpeg", "png"], accept_multiple_files=True)
+    uploaded_files = st.file_uploader(
+        "Select multiple OMR Photos",
+        type=["jpg", "jpeg", "png"],
+        accept_multiple_files=True
+    )
 
 if uploaded_files:
     num_questions = len(answer_list)
@@ -203,49 +290,100 @@ if uploaded_files:
     elif num_questions > 30:
         st.error(f"⚠️ Maximum 30 questions supported. You entered {num_questions}.")
     else:
-        st.success(f"Grading out of **{num_questions} questions**. Processing {len(uploaded_files)} paper(s)...")
+        st.success(f"Grading **{num_questions}** questions. Processing {len(uploaded_files)} paper(s)...")
         class_results = []
+        COLUMN_ROIS = get_absolute_rois(WARPED_SIZE[0], WARPED_SIZE[1])
 
         for file in uploaded_files:
             bytes_data = file.getvalue()
-            file_bytes = np.frombuffer(bytes_data, np.uint8)
-            image = cv2.imdecode(file_bytes, cv2.IMREAD_COLOR)
+
+            # FIX: Handle EXIF orientation via PIL (critical for mobile!)
+            pil_img = Image.open(io.BytesIO(bytes_data))
+            pil_img = ImageOps.exif_transpose(pil_img)
+            pil_img = pil_img.convert("RGB")
+            image = np.array(pil_img)
+            image = cv2.cvtColor(image, cv2.COLOR_RGB2BGR)
+
+            if image is None:
+                st.error(f"❌ Could not read image **{file.name}**.")
+                continue
+
+            # FIX: Resize massive mobile photos to prevent crashes/timeouts
+            max_dim = 2000
+            h, w = image.shape[:2]
+            if max(h, w) > max_dim:
+                scale = max_dim / max(h, w)
+                image = cv2.resize(image, None, fx=scale, fy=scale)
 
             corners = find_sheet_contour(image)
 
             if corners is None:
                 st.error(f"❌ Could not detect sheet boundaries in **{file.name}**.")
+                if debug_mode:
+                    st.image(cv2.cvtColor(image, cv2.COLOR_BGR2RGB), caption="Original Image")
                 class_results.append({"Filename": file.name, "Score": "Error", "Percentage": "Error"})
-            else:
-                warped = four_point_transform(image, corners, WARPED_SIZE)
-                gray = cv2.cvtColor(warped, cv2.COLOR_BGR2GRAY)
-                gray = cv2.GaussianBlur(gray, (3, 3), 0)
-                thresh = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV | cv2.THRESH_OTSU)[1]
+                continue
 
-                total_correct = 0
-                for col_idx, (x, y, w, h) in enumerate(COLUMN_ROIS):
-                    roi_thresh = thresh[y:y + h, x:x + w]
-                    roi_color = warped[y:y + h, x:x + w]
-                    start_q = col_idx * 10 + 1
-                    if start_q <= num_questions:
-                        _, col_score = process_column(roi_thresh, roi_color, start_q, answer_list, OPTIONS)
-                        total_correct += col_score
+            warped = four_point_transform(image, corners, WARPED_SIZE)
+            gray = cv2.cvtColor(warped, cv2.COLOR_BGR2GRAY)
+            gray = cv2.GaussianBlur(gray, (3, 3), 0)
 
-                score_pct = (total_correct / num_questions) * 100
-                class_results.append({"Filename": file.name, "Score": total_correct, "Percentage": f"{score_pct:.1f}%"})
+            # FIX: Try both Otsu and Adaptive; use Otsu by default
+            thresh_otsu = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV | cv2.THRESH_OTSU)[1]
+            thresh_adaptive = cv2.adaptiveThreshold(
+                gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY_INV, 51, 10
+            )
+            thresh = thresh_otsu
 
-                cv2.putText(warped, f"Score: {total_correct}/{num_questions} ({score_pct:.1f}%)",
-                            (30, 50), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 0, 255), 2)
+            if debug_mode:
+                c1, c2 = st.columns(2)
+                with c1:
+                    st.image(thresh_otsu, caption="Otsu Threshold")
+                with c2:
+                    st.image(thresh_adaptive, caption="Adaptive Threshold")
 
-                warped_rgb = cv2.cvtColor(warped, cv2.COLOR_BGR2RGB)
-                with st.expander(f"📄 Result for {file.name} - Score: {total_correct}/{num_questions}"):
-                    st.image(warped_rgb, use_column_width=True)
+            total_correct = 0
+
+            for col_idx, (x, y, w, h) in enumerate(COLUMN_ROIS):
+                roi_thresh = thresh[y:y + h, x:x + w]
+                roi_color = warped[y:y + h, x:x + w]
+                start_q = col_idx * 10 + 1
+
+                if start_q <= num_questions:
+                    _, col_score = process_column(
+                        roi_thresh, roi_color, start_q, answer_list, OPTIONS, debug=debug_mode
+                    )
+                    total_correct += col_score
+
+                    # FIX: Debug visualization of detected bubbles
+                    if debug_mode:
+                        st.image(
+                            cv2.cvtColor(roi_color, cv2.COLOR_BGR2RGB),
+                            caption=f"Column {col_idx + 1} (Q{start_q}-Q{start_q + 9})"
+                        )
+
+            score_pct = (total_correct / num_questions) * 100
+            class_results.append({
+                "Filename": file.name,
+                "Score": total_correct,
+                "Percentage": f"{score_pct:.1f}%"
+            })
+
+            cv2.putText(
+                warped,
+                f"Score: {total_correct}/{num_questions} ({score_pct:.1f}%)",
+                (30, 50), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 0, 255), 2
+            )
+
+            warped_rgb = cv2.cvtColor(warped, cv2.COLOR_BGR2RGB)
+            with st.expander(f"📄 Result for {file.name} — Score: {total_correct}/{num_questions}"):
+                st.image(warped_rgb, use_column_width=True)
 
         if len(class_results) > 1:
             st.subheader("📊 Class Summary Table")
             st.table(class_results)
 
-# --- Instructions & Language Selector ---
+# --- Instructions ---
 st.markdown("---")
 col_title, col_lang = st.columns([2.5, 1.5])
 with col_lang:
@@ -257,32 +395,33 @@ if language == "English":
     with st.expander("Click to view About & How to Use", expanded=False):
         st.markdown("""
 ### 🏫 About the App
-This app is designed for **Feni Model High School** teachers to quickly and accurately grade multiple-choice (MCQ) answer sheets using a mobile camera or uploaded files.
+This app is designed for **Feni Model High School** teachers to quickly grade MCQ answer sheets using a mobile camera or uploaded files.
 ---
 ### 📱 Step-by-Step Instructions:
-1. **Set the Answer Key (Sidebar):** Type your correct answers separated by commas (e.g., `A, B, C, D...`).
+1. **Set the Answer Key (Sidebar):** Type correct answers separated by commas (e.g., `A, B, C, D...`).
    * *Key Reference: A = ক | B = খ | C = গ | D = ঘ*
 2. **Choose Input Mode:**
-   * 📸 **Camera:** Grade sheets live one-by-one.
-   * 📁 **Bulk Upload:** Upload up to 120+ student photos from your gallery at once!
+   * 📸 **Camera:** Grade sheets one-by-one.
+   * 📁 **Bulk Upload:** Upload multiple student photos at once.
 3. **Important Scanning Tips:**
-   * Place paper flat on a dark surface (like a desk).
-   * Ensure **all 4 corners** of the sheet are visible in the photo.
-   * Make sure the room is well-lit without heavy shadows.
-4. **View Results:** See instant total scores, annotated green/red marked sheets, and a complete class summary table!
+   * Place paper flat on a **dark surface**.
+   * Ensure **all 4 corners** are visible.
+   * Use good lighting without heavy shadows.
+   * Hold phone parallel to the paper (avoid steep angles).
+4. **Debug Mode:** Enable in sidebar if grading looks wrong — it shows thresholded images and detected bubbles.
 """)
 else:
     with st.expander("অ্যাপ পরিচিতি ও নিয়ম দেখতে এখানে ক্লিক করুন", expanded=False):
         st.markdown("""
 ### 🏫 ওএমআর গ্রেডার পরিচিতি
-এই ওয়েব অ্যাপটি **ফেনী মডেল হাই স্কুল**-এর শিক্ষকদের জন্য তৈরি করা হয়েছে। এর মাধ্যমে যেকোনো স্মার্টফোন ক্যামেরা বা কম্পিউটারের সাহায্যে খুব সহজেই এবং দ্রুত বহুনির্বাচনী (MCQ) উত্তরপত্র মূল্যায়ন করা যাবে।
+এই ওয়েব অ্যাপটি **ফেনী মডেল হাই স্কুল**-এর শিক্ষকদের জন্য তৈরি।
 ---
 ### 📱 ব্যবহারের নিয়মাবলি:
-১. **উত্তরমালা সেটিং (সাইডবার):** সাইডবারে কমা দিয়ে সঠিক উত্তরগুলো লিখুন (যেমন: `A, B, C, D...`)।
+১. **উত্তরমালা সেটিং (সাইডবার):** কমা দিয়ে সঠিক উত্তরগুলো লিখুন (যেমন: `A, B, C, D...`)।
    * *সংকেত: A = ক | B = খ | C = গ | D = ঘ*
 ২. **মোড নির্বাচন করুন:**
-   * 📸 **ক্যামেরা:** একে একে প্রতিটি উত্তরপত্রের ছবি তুলে চেক করুন।
-   * 📁 **বাল্ক আপলোড:** একসাথে পুরো ক্লাসের (১২০+ টি) ছবি গ্যালারি থেকে সিলেক্ট করে আপলোড করুন!
+   * 📸 **ক্যামেরা:** একে একে প্রতিটি উত্তরপত্রের ছবি তুলুন।
+   * 📁 **বাল্ক আপলোড:** একসাথে পুরো ক্লাসের ছবি আপলোড করুন!
 ৩. **ছবি তোলার জরুরি টিপস:**
    * কাগজটি একটি অন্ধকার বা গাঢ় টেবিলের ওপর সোজা করে রাখুন।
    * ছবির ভেতরে যেন উত্তরপত্রের **৪টি কোণই** পরিষ্কার দেখা যায়।
