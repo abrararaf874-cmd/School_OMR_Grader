@@ -226,12 +226,20 @@ if uploaded_files:
             st.subheader("📊 Class Summary Table")
             st.table(class_results)
 
-# --- Language Selector & App Description ---
-st.sidebar.markdown("---")
-language = st.sidebar.radio("🌐 Language / ভাষা", ["English", "বাংলা"])
+# --- Instructions & Language Selector ---
+st.markdown("---")
+
+# Place Instruction header and Language dropdown side-by-side
+col_title, col_lang = st.columns([2.5, 1.5])
+
+with col_lang:
+    language = st.selectbox("🌐 Language / ভাষা", ["English", "বাংলা"])
+
+with col_title:
+    st.subheader("📖 Instructions" if language == "English" else "📖 ব্যবহারের নিয়ম")
 
 if language == "English":
-    with st.expander("📖 About & How to Use This App", expanded=False):
+    with st.expander("Click to view About & How to Use", expanded=False):
         st.markdown("""
         ### 🏫 About the App
         This app is designed for **Feni Model High School** teachers to quickly and accurately grade multiple-choice (MCQ) answer sheets using a mobile camera or uploaded files.
@@ -251,7 +259,7 @@ if language == "English":
         4. **View Results:** See instant total scores, annotated green/red marked sheets, and a complete class summary table!
         """)
 else:
-    with st.expander("📖 অ্যাপ পরিচিতি ও ব্যবহারের নিয়ম", expanded=False):
+    with st.expander("অ্যাপ পরিচিতি ও নিয়ম দেখতে এখানে ক্লিক করুন", expanded=False):
         st.markdown("""
         ### 🏫 ওএমআর গ্রেডার পরিচিতি
         এই ওয়েব অ্যাপটি **ফেনী মডেল হাই স্কুল**-এর শিক্ষকদের জন্য তৈরি করা হয়েছে। এর মাধ্যমে যেকোনো স্মার্টফোন ক্যামেরা বা কম্পিউটারের সাহায্যে খুব সহজেই এবং দ্রুত বহুনির্বাচনী (MCQ) উত্তরপত্র মূল্যায়ন করা যাবে।
