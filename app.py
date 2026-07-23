@@ -1,6 +1,7 @@
 """
 app.py - Feni Model High School OMR Grader (Robust Mobile Version)
 """
+
 import cv2
 import numpy as np
 import streamlit as st
@@ -18,7 +19,6 @@ st.set_page_config(
 OPTIONS = ["A", "B", "C", "D"]
 WARPED_SIZE = (850, 1100)
 
-# FIX: Relative ROIs so they scale with WARPED_SIZE
 COLUMN_ROIS_REL = [
     (0.40, 0.52, 0.19, 0.44),
     (0.59, 0.52, 0.19, 0.44),
@@ -28,7 +28,7 @@ COLUMN_ROIS_REL = [
 MIN_BUBBLE_DIM = 10
 MAX_BUBBLE_DIM = 45
 FILL_RATIO_THRESHOLD = 0.35
-MULTI_MARK_RELATIVE_MARGIN = 0.28  # FIX: Relative instead of absolute
+MULTI_MARK_RELATIVE_MARGIN = 0.28
 Y_CLUSTER_TOLERANCE = 18
 MIN_CIRCULARITY = 0.65
 
@@ -61,9 +61,6 @@ def four_point_transform(image, pts, out_size):
 
 
 def find_sheet_contour(image):
-    """
-    FIX: Added Canny fallback and lowered area threshold for mobile photos.
-    """
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
     blurred = cv2.GaussianBlur(gray, (5, 5), 0)
 
@@ -74,7 +71,7 @@ def find_sheet_contour(image):
 
     cnts, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
-    # FIX: Fallback to Canny if Otsu finds nothing useful
+    # Fallback to Canny
     if not cnts:
         edges = cv2.Canny(blurred, 50, 150)
         edges = cv2.dilate(edges, np.ones((5, 5), np.uint8), iterations=2)
@@ -86,7 +83,6 @@ def find_sheet_contour(image):
     largest = max(cnts, key=cv2.contourArea)
     img_area = image.shape[0] * image.shape[1]
 
-    # FIX: Lowered from 0.15 to 0.08 for mobile photos
     if cv2.contourArea(largest) < 0.08 * img_area:
         return None
 
@@ -102,9 +98,6 @@ def find_sheet_contour(image):
 
 
 def is_valid_bubble(c):
-    """
-    FIX: Added circularity check to reject text fragments and noise.
-    """
     x, y, w, h = cv2.boundingRect(c)
     if not (MIN_BUBBLE_DIM <= w <= MAX_BUBBLE_DIM and MIN_BUBBLE_DIM <= h <= MAX_BUBBLE_DIM):
         return False
@@ -121,14 +114,10 @@ def is_valid_bubble(c):
 
 
 def cluster_bubbles_into_rows(bubbles, y_tolerance=Y_CLUSTER_TOLERANCE):
-    """
-    FIX: Replaced fragile 'slice every 4' with proper y-coordinate clustering.
-    Handles missing bubbles and noise gracefully.
-    """
     if not bubbles:
         return []
 
-    bubbles = sorted(bubbles, key=lambda b: b[1][1])  # Sort by y
+    bubbles = sorted(bubbles, key=lambda b: b[1][1])
     rows = []
     current_row = [bubbles[0]]
 
@@ -140,7 +129,7 @@ def cluster_bubbles_into_rows(bubbles, y_tolerance=Y_CLUSTER_TOLERANCE):
             current_row.append(bubble)
         else:
             current_row = sorted(current_row, key=lambda b: b[1][0])
-            if len(current_row) >= 3:  # At least 3 of 4 options
+            if len(current_row) >= 3:
                 rows.append(current_row)
             current_row = [bubble]
 
@@ -162,7 +151,6 @@ def process_column(roi_thresh, roi_color, start_q_num, answer_key, options, debu
     col_results = []
     correct_count = 0
 
-    # FIX: Graceful minimum instead of strict modulo check
     if len(bubbles) < 12:
         if debug:
             st.warning(f"Col starting Q{start_q_num}: Only {len(bubbles)} bubbles found.")
@@ -185,7 +173,6 @@ def process_column(roi_thresh, roi_color, start_q_num, answer_key, options, debu
 
         row = sorted(row, key=lambda b: b[1][0])
 
-        # FIX: If noise gives >4 bubbles, keep the 4 largest (most likely real bubbles)
         if len(row) > 4:
             row = sorted(row, key=lambda b: -cv2.contourArea(b[0]))[:4]
             row = sorted(row, key=lambda b: b[1][0])
@@ -194,8 +181,6 @@ def process_column(roi_thresh, roi_color, start_q_num, answer_key, options, debu
         for c, (x, y, w, h) in row[:4]:
             mask = np.zeros(roi_thresh.shape, dtype="uint8")
             cv2.drawContours(mask, [c], -1, 255, -1)
-
-            # FIX: Erode mask slightly to ignore border pixels
             mask = cv2.erode(mask, np.ones((2, 2), np.uint8), iterations=1)
 
             bubble_area = cv2.countNonZero(mask)
@@ -215,7 +200,6 @@ def process_column(roi_thresh, roi_color, start_q_num, answer_key, options, debu
 
         if best_val < FILL_RATIO_THRESHOLD:
             marked = None
-        # FIX: Relative margin for multi-mark detection
         elif runner_up > 0 and ((best_val - runner_up) / best_val) < MULTI_MARK_RELATIVE_MARGIN:
             marked = "MULTI"
         else:
@@ -264,17 +248,25 @@ answer_list = [a.strip().upper() for a in user_key.split(",") if a.strip()]
 
 debug_mode = st.sidebar.checkbox("🔍 Debug Mode", value=False)
 
+# Default to Bulk Upload so camera is NEVER requested automatically
 input_mode = st.radio(
     "Choose Input Method:",
-    ["📸 Camera (One by One)", "📁 Bulk Upload (Whole Class)"],
+    ["📁 Bulk Upload (Whole Class)", "📸 Camera (One by One)"],
+    index=0,
     horizontal=True
 )
 
 uploaded_files = []
+
 if input_mode == "📸 Camera (One by One)":
-    cam_photo = st.camera_input("Point camera directly at the sheet")
-    if cam_photo:
-        uploaded_files.append(cam_photo)
+    # Explicit checkbox prevents browser camera request until user clicks it
+    start_cam = st.checkbox("📷 Start Camera", value=False)
+    if start_cam:
+        cam_photo = st.camera_input("Point camera directly at the sheet")
+        if cam_photo:
+            uploaded_files.append(cam_photo)
+    else:
+        st.info("Check **'Start Camera'** above when you are ready to take a picture.")
 else:
     uploaded_files = st.file_uploader(
         "Select multiple OMR Photos",
@@ -297,7 +289,6 @@ if uploaded_files:
         for file in uploaded_files:
             bytes_data = file.getvalue()
 
-            # FIX: Handle EXIF orientation via PIL (critical for mobile!)
             pil_img = Image.open(io.BytesIO(bytes_data))
             pil_img = ImageOps.exif_transpose(pil_img)
             pil_img = pil_img.convert("RGB")
@@ -308,7 +299,6 @@ if uploaded_files:
                 st.error(f"❌ Could not read image **{file.name}**.")
                 continue
 
-            # FIX: Resize massive mobile photos to prevent crashes/timeouts
             max_dim = 2000
             h, w = image.shape[:2]
             if max(h, w) > max_dim:
@@ -328,7 +318,6 @@ if uploaded_files:
             gray = cv2.cvtColor(warped, cv2.COLOR_BGR2GRAY)
             gray = cv2.GaussianBlur(gray, (3, 3), 0)
 
-            # FIX: Try both Otsu and Adaptive; use Otsu by default
             thresh_otsu = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV | cv2.THRESH_OTSU)[1]
             thresh_adaptive = cv2.adaptiveThreshold(
                 gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY_INV, 51, 10
@@ -355,7 +344,6 @@ if uploaded_files:
                     )
                     total_correct += col_score
 
-                    # FIX: Debug visualization of detected bubbles
                     if debug_mode:
                         st.image(
                             cv2.cvtColor(roi_color, cv2.COLOR_BGR2RGB),
@@ -396,13 +384,15 @@ if language == "English":
         st.markdown("""
 ### 🏫 About the App
 This app is designed for **Feni Model High School** teachers to quickly grade MCQ answer sheets using a mobile camera or uploaded files.
+
 ---
+
 ### 📱 Step-by-Step Instructions:
 1. **Set the Answer Key (Sidebar):** Type correct answers separated by commas (e.g., `A, B, C, D...`).
    * *Key Reference: A = ক | B = খ | C = গ | D = ঘ*
 2. **Choose Input Mode:**
-   * 📸 **Camera:** Grade sheets one-by-one.
    * 📁 **Bulk Upload:** Upload multiple student photos at once.
+   * 📸 **Camera:** Check 'Start Camera' to grade sheets one-by-one.
 3. **Important Scanning Tips:**
    * Place paper flat on a **dark surface**.
    * Ensure **all 4 corners** are visible.
@@ -415,13 +405,15 @@ else:
         st.markdown("""
 ### 🏫 ওএমআর গ্রেডার পরিচিতি
 এই ওয়েব অ্যাপটি **ফেনী মডেল হাই স্কুল**-এর শিক্ষকদের জন্য তৈরি।
+
 ---
+
 ### 📱 ব্যবহারের নিয়মাবলি:
 ১. **উত্তরমালা সেটিং (সাইডবার):** কমা দিয়ে সঠিক উত্তরগুলো লিখুন (যেমন: `A, B, C, D...`)।
    * *সংকেত: A = ক | B = খ | C = গ | D = ঘ*
 ২. **মোড নির্বাচন করুন:**
-   * 📸 **ক্যামেরা:** একে একে প্রতিটি উত্তরপত্রের ছবি তুলুন।
    * 📁 **বাল্ক আপলোড:** একসাথে পুরো ক্লাসের ছবি আপলোড করুন!
+   * 📸 **ক্যামেরা:** 'Start Camera' চেক বক্সে টিক দিয়ে একে একে প্রতিটি উত্তরপত্রের ছবি তুলুন।
 ৩. **ছবি তোলার জরুরি টিপস:**
    * কাগজটি একটি অন্ধকার বা গাঢ় টেবিলের ওপর সোজা করে রাখুন।
    * ছবির ভেতরে যেন উত্তরপত্রের **৪টি কোণই** পরিষ্কার দেখা যায়।
